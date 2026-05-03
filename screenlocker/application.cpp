@@ -22,8 +22,8 @@
 // Qt Core
 #include <QAbstractNativeEventFilter>
 #include <QScreen>
-#include <QX11Info>
 #include <QEvent>
+#include <QtGui/qguiapplication_platform.h>
 
 // Qt Quick
 #include <QQuickItem>
@@ -46,7 +46,7 @@
 class FocusOutEventFilter : public QAbstractNativeEventFilter
 {
 public:
-    bool nativeEventFilter(const QByteArray &eventType, void *message, long int *result) override {
+    bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override {
         Q_UNUSED(result)
         if (qstrcmp(eventType, "xcb_generic_event_t") != 0) {
             return false;
@@ -61,6 +61,11 @@ public:
     }
 };
 
+static bool isX11()
+{
+    return qGuiApp->platformName() == QLatin1String("xcb");
+}
+
 Application::Application(int &argc, char **argv)
     : QGuiApplication(argc, argv)
     , m_authenticator(new Authenticator(AuthenticationMode::Direct, this))
@@ -74,7 +79,7 @@ Application::Application(int &argc, char **argv)
     connect(this, &Application::screenAdded, this, &Application::onScreenAdded);
     connect(this, &Application::screenRemoved, this, &Application::desktopResized);
 
-    if (QX11Info::isPlatformX11()) {
+    if (isX11()) {
         installNativeEventFilter(new FocusOutEventFilter);
     }
 }
@@ -83,7 +88,7 @@ Application::~Application()
 {
     // workaround QTBUG-55460
     // will be fixed when themes port to QQC2
-    for (auto view : qAsConst(m_views)) {
+    for (auto view : std::as_const(m_views)) {
         if (QQuickItem *focusItem = view->activeFocusItem()) {
             focusItem->setFocus(false);
         }
@@ -128,18 +133,12 @@ void Application::desktopResized()
         view->setGeometry(screen->geometry());
 
         if (!m_testing) {
-            if (QX11Info::isPlatformX11()) {
+            if (isX11()) {
                 view->setFlags(Qt::X11BypassWindowManagerHint);
             } else {
                 view->setFlags(Qt::FramelessWindowHint);
             }
         }
-
-        // overwrite the factory set by kdeclarative
-        // auto oldFactory = view->engine()->networkAccessManagerFactory();
-        // view->engine()->setNetworkAccessManagerFactory(nullptr);
-        // delete oldFactory;
-        // view->engine()->setNetworkAccessManagerFactory(new NoAccessNetworkAccessManagerFactory);
 
         view->setGeometry(screen->geometry());
 
@@ -155,7 +154,7 @@ void Application::desktopResized()
         view->setScreen(screen);
 
         // on Wayland we may not use fullscreen as that puts all windows on one screen
-        if (m_testing || QX11Info::isPlatformX11()) {
+        if (m_testing || isX11()) {
             view->show();
         } else {
             view->showFullScreen();
@@ -219,16 +218,15 @@ void Application::getFocus()
 
     // this loop is required to make the qml/graphicsscene properly handle the shared keyboard input
     // ie. "type something into the box of every greeter"
-    for (QQuickView *view : qAsConst(m_views)) {
+    for (QQuickView *view : std::as_const(m_views)) {
         if (!m_testing) {
-            view->setKeyboardGrabEnabled(true); // TODO - check whether this still works in master!
+            view->setKeyboardGrabEnabled(true);
         }
     }
 
     // activate window and grab input to be sure it really ends up there.
-    // focus setting is still required for proper internal QWidget state (and eg. visual reflection)
     if (!m_testing) {
-        activeScreen->setKeyboardGrabEnabled(true); // TODO - check whether this still works in master!
+        activeScreen->setKeyboardGrabEnabled(true);
     }
 
     activeScreen->requestActivate();
@@ -248,22 +246,25 @@ bool Application::eventFilter(QObject *obj, QEvent *event)
 {
     if (obj != this && event->type() == QEvent::Show) {
         QQuickView *view = nullptr;
-        for (QQuickView *v : qAsConst(m_views)) {
+        for (QQuickView *v : std::as_const(m_views)) {
             if (v == obj) {
                 view = v;
                 break;
             }
         }
-        if (view && view->winId() && QX11Info::isPlatformX11()) {
-            // showing greeter view window, set property
-            static Atom tag = XInternAtom(QX11Info::display(), "_KDE_SCREEN_LOCKER", False);
-            XChangeProperty(QX11Info::display(), view->winId(), tag, tag, 32, PropModeReplace, nullptr, 0);
+        if (view && view->winId() && isX11()) {
+            // showing greeter view window, set _KDE_SCREEN_LOCKER property
+            if (auto *x11app = qGuiApp->nativeInterface<QNativeInterface::QX11Application>()) {
+                Display *dpy = x11app->display();
+                static Atom tag = XInternAtom(dpy, "_KDE_SCREEN_LOCKER", False);
+                XChangeProperty(dpy, view->winId(), tag, tag, 32, PropModeReplace, nullptr, 0);
+            }
         }
         // no further processing
         return false;
     }
 
-    if (event->type() == QEvent::MouseButtonPress && QX11Info::isPlatformX11()) {
+    if (event->type() == QEvent::MouseButtonPress && isX11()) {
         if (getActiveScreen()) {
             getActiveScreen()->requestActivate();
         }
@@ -293,7 +294,7 @@ QWindow *Application::getActiveScreen()
         return activeScreen;
     }
 
-    for (QQuickView *view : qAsConst(m_views)) {
+    for (QQuickView *view : std::as_const(m_views)) {
         if (view->geometry().contains(QCursor::pos())) {
             activeScreen = view;
             break;
@@ -309,15 +310,11 @@ QWindow *Application::getActiveScreen()
 void Application::shareEvent(QEvent *e, QQuickView *from)
 {
     // from can be NULL any time (because the parameter is passed as qobject_cast)
-    // m_views.contains(from) is atm. supposed to be true but required if any further
-    // QQuickView are added (which are not part of m_views)
-    // this makes "from" an optimization (nullptr check aversion)
     if (from && m_views.contains(from)) {
         // NOTICE any recursion in the event sharing will prevent authentication on multiscreen setups!
-        // Any change in regarded event processing shall be tested thoroughly!
         removeEventFilter(this); // prevent recursion!
         const bool accepted = e->isAccepted(); // store state
-        for (QQuickView *view : qAsConst(m_views)) {
+        for (QQuickView *view : std::as_const(m_views)) {
             if (view != from) {
                 QCoreApplication::sendEvent(view, e);
                 e->setAccepted(accepted);
@@ -329,10 +326,6 @@ void Application::shareEvent(QEvent *e, QQuickView *from)
 
 void Application::screenGeometryChanged(QScreen *screen, const QRect &geo)
 {
-    // We map screens() to m_views by index and Qt is free to
-    // reorder screens, so pointer to pointer connections
-    // may not remain matched by index, perform index
-    // mapping in the change event itself
     const int screenIndex = QGuiApplication::screens().indexOf(screen);
     if (screenIndex < 0) {
         qWarning() << "Screen not found, not updating geometry" << screen;

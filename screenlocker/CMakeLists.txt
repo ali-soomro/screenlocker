@@ -17,13 +17,17 @@ add_executable(cutefish-screenlocker
 
 target_link_libraries(cutefish-screenlocker
     PRIVATE
-    Qt5::Core
-    Qt5::DBus
-    Qt5::Widgets
-    Qt5::X11Extras
-    Qt5::Quick
-
+    Qt6::Core
+    Qt6::DBus
+    Qt6::Widgets
+    Qt6::Quick
     ${X11_LIBRARIES}
 )
+
+target_include_directories(cutefish-screenlocker PRIVATE ${X11_INCLUDE_DIR})
+
+file(GLOB TS_FILES ${CMAKE_SOURCE_DIR}/translations/*.ts)
+qt6_add_lrelease(cutefish-screenlocker TS_FILES ${TS_FILES} QM_FILES_OUTPUT_VARIABLE QM_FILES)
+install(FILES ${QM_FILES} DESTINATION /usr/share/cutefish-screenlocker/translations)
 
 install(TARGETS cutefish-screenlocker RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
